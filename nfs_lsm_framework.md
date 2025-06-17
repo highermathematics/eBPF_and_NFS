@@ -1201,6 +1201,39 @@ graph TD
     J -->|r键| N[重置规则]
 ```
 
+#### 执行顺序和交互流程
+
+```mermaid
+sequenceDiagram
+    participant 用户
+    participant 加载器
+    participant eBPF程序
+    participant ML服务
+    
+    用户->>加载器: 启动监控系统 (--ml on/off)
+    加载器->>eBPF程序: 加载并设置初始ML开关
+    加载器->>ML服务: 启动服务线程 (如果启用ML)
+    
+    loop 文件操作
+        NFS客户端->>eBPF程序: 文件操作请求
+        eBPF程序->>eBPF程序: 执行基础安全检查
+        alt ML开启
+            eBPF程序->>eBPF程序: 提取详细特征
+            eBPF程序->>ML服务: 发送特征数据
+            ML服务->>ML服务: 执行模型推理
+            alt 检测到异常
+                ML服务->>eBPF程序: 添加动态拦截规则
+            end
+        else ML关闭
+            eBPF程序->>加载器: 发送基础事件
+        end
+        eBPF程序->>NFS客户端: 允许/拒绝访问
+    end
+    
+    用户->>加载器: 运行时调整ML开关
+    加载器->>eBPF程序: 更新开关状态MAP
+```
+
 ### 5. 部署和使用说明
 
 #### 系统要求
