@@ -1,3 +1,4 @@
+nfs_monitor.bpf.c
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
@@ -398,7 +399,7 @@ char _license[] SEC("license") = "GPL";
 
 
 
-nfs_security_loader.py
+nfs_monitor_loader.py
 #!/usr/bin/env python3
 from bcc import BPF
 import ctypes
