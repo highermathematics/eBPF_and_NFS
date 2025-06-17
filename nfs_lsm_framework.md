@@ -1,4 +1,144 @@
-### 1. eBPF内核程序 (`nfs_monitor.bpf.c`)
+### 1. 系统架构和工作流程
+
+```mermaid
+graph TD
+    A[NFS Client] --> B[LSM安全钩子]
+    B --> C{ML开关状态}
+    C -->|ON| D[提取详细特征]
+    C -->|OFF| E[记录基础事件]
+    D --> F[特征上报Ringbuf]
+    F --> G[用户态ML服务]
+    G -->|异常检测| H[更新拦截规则]
+    H --> I[拦截规则MAP]
+    I --> B
+    J[交互控制台] -->|m键| K[开关状态MAP]
+    K --> C
+    J -->|s键| L[显示统计]
+    J -->|t键| M[训练模型]
+    J -->|r键| N[重置规则]
+```
+
+#### 执行顺序和交互流程
+
+```mermaid
+sequenceDiagram
+    participant 用户
+    participant 加载器
+    participant eBPF程序
+    participant ML服务
+    
+    用户->>加载器: 启动监控系统 (--ml on/off)
+    加载器->>eBPF程序: 加载并设置初始ML开关
+    加载器->>ML服务: 启动服务线程 (如果启用ML)
+    
+    loop 文件操作
+        NFS客户端->>eBPF程序: 文件操作请求
+        eBPF程序->>eBPF程序: 执行基础安全检查
+        alt ML开启
+            eBPF程序->>eBPF程序: 提取详细特征
+            eBPF程序->>ML服务: 发送特征数据
+            ML服务->>ML服务: 执行模型推理
+            alt 检测到异常
+                ML服务->>eBPF程序: 添加动态拦截规则
+            end
+        else ML关闭
+            eBPF程序->>加载器: 发送基础事件
+        end
+        eBPF程序->>NFS客户端: 允许/拒绝访问
+    end
+    
+    用户->>加载器: 运行时调整ML开关
+    加载器->>eBPF程序: 更新开关状态MAP
+```
+
+### 2. 部署和使用说明
+
+#### 系统要求
+- Linux内核 5.8+
+- eBPF支持 (CONFIG_BPF_SYSCALL=y)
+- LSM eBPF支持 (CONFIG_BPF_LSM=y)
+- Python 3.8+
+- 依赖库: `bcc`, `onnxruntime`, `scikit-learn`, `pandas`
+
+#### 安装依赖
+```bash
+# 安装系统依赖
+sudo apt update
+sudo apt install bpfcc-tools libbpfcc-dev linux-headers-$(uname -r) clang llvm
+
+# 安装Python依赖
+pip install bcc onnxruntime scikit-learn pandas skl2onnx
+```
+
+#### 编译和运行
+```bash
+# 1. 编译eBPF程序
+clang -O2 -target bpf -c nfs_monitor.bpf.c -o nfs_monitor.o
+
+# 2. 训练初始模型 (可选)
+python ml_service.py --train
+
+# 3. 启动监控系统
+sudo python nfs_monitor_loader.py
+```
+
+#### 运行时控制
+```
+交互命令:
+  m: 切换ML功能开关
+  s: 显示统计信息
+  t: 训练新模型
+  r: 重置所有拦截规则
+  q: 退出
+```
+
+#### 功能演示
+1. **启动系统**:
+   ```
+   $ sudo python nfs_monitor_loader.py
+   编译和加载eBPF程序...
+   ML功能已开启
+   已附加LSM钩子: file_open -> nfs_file_open
+   ...
+   NFS安全监控系统已启动
+   基础防护层始终运行
+   机器学习层: 启用
+   按 'm' 键切换ML开关, 's' 查看统计, 'q' 退出
+   ```
+
+2. **触发安全事件**:
+   ```
+   [安全警报] 2023-10-15 14:30:22 UNLINK /etc/important.conf
+     原因: 非特权用户修改敏感文件
+     进程: crypt_tool(5678), 用户: user_1001
+     客户端: 192.168.1.100, 大小: 1024字节
+     添加临时拦截规则: inode=123456, 操作=UNLINK
+   ```
+
+3. **切换ML开关**:
+   ```
+   按 'm' 键
+   ML功能已关闭
+   ```
+
+4. **查看统计**:
+   ```
+   按 's' 键
+   
+   ===== 系统统计 =====
+   总事件数: 1245
+   ML处理事件: 845
+   检测异常: 12
+   添加规则: 8
+   
+   ===== ML模型统计 =====
+   总事件数: 845
+   异常事件数: 12
+   最后异常时间: 2023-10-15T14:30:22.123456
+   ```
+
+
+### 3. eBPF内核程序 (`nfs_monitor.bpf.c`)
 
 ```c
 #include <linux/bpf.h>
@@ -599,7 +739,7 @@ int BPF_PROG(nfs_rename, struct inode *old_dir, struct dentry *old_dentry,
 char _license[] SEC("license") = "GPL";
 ```
 
-### 2. ML模型服务 (`ml_service.py`)
+### 4. ML模型服务 (`ml_service.py`)
 
 ```python
 #!/usr/bin/env python3
@@ -871,7 +1011,7 @@ if __name__ == "__main__":
     print(f"最后异常时间: {detector.stats['last_anomaly']}")
 ```
 
-### 3. 用户态加载器 (`nfs_monitor_loader.py`)
+### 5. 用户态加载器 (`nfs_monitor_loader.py`)
 
 ```python
 #!/usr/bin/env python3
@@ -1179,144 +1319,6 @@ if __name__ == "__main__":
     main()
 ```
 
-### 4. 系统架构和工作流程
-
-```mermaid
-graph TD
-    A[NFS Client] --> B[LSM安全钩子]
-    B --> C{ML开关状态}
-    C -->|ON| D[提取详细特征]
-    C -->|OFF| E[记录基础事件]
-    D --> F[特征上报Ringbuf]
-    F --> G[用户态ML服务]
-    G -->|异常检测| H[更新拦截规则]
-    H --> I[拦截规则MAP]
-    I --> B
-    J[交互控制台] -->|m键| K[开关状态MAP]
-    K --> C
-    J -->|s键| L[显示统计]
-    J -->|t键| M[训练模型]
-    J -->|r键| N[重置规则]
-```
-
-#### 执行顺序和交互流程
-
-```mermaid
-sequenceDiagram
-    participant 用户
-    participant 加载器
-    participant eBPF程序
-    participant ML服务
-    
-    用户->>加载器: 启动监控系统 (--ml on/off)
-    加载器->>eBPF程序: 加载并设置初始ML开关
-    加载器->>ML服务: 启动服务线程 (如果启用ML)
-    
-    loop 文件操作
-        NFS客户端->>eBPF程序: 文件操作请求
-        eBPF程序->>eBPF程序: 执行基础安全检查
-        alt ML开启
-            eBPF程序->>eBPF程序: 提取详细特征
-            eBPF程序->>ML服务: 发送特征数据
-            ML服务->>ML服务: 执行模型推理
-            alt 检测到异常
-                ML服务->>eBPF程序: 添加动态拦截规则
-            end
-        else ML关闭
-            eBPF程序->>加载器: 发送基础事件
-        end
-        eBPF程序->>NFS客户端: 允许/拒绝访问
-    end
-    
-    用户->>加载器: 运行时调整ML开关
-    加载器->>eBPF程序: 更新开关状态MAP
-```
-
-### 5. 部署和使用说明
-
-#### 系统要求
-- Linux内核 5.8+
-- eBPF支持 (CONFIG_BPF_SYSCALL=y)
-- LSM eBPF支持 (CONFIG_BPF_LSM=y)
-- Python 3.8+
-- 依赖库: `bcc`, `onnxruntime`, `scikit-learn`, `pandas`
-
-#### 安装依赖
-```bash
-# 安装系统依赖
-sudo apt update
-sudo apt install bpfcc-tools libbpfcc-dev linux-headers-$(uname -r) clang llvm
-
-# 安装Python依赖
-pip install bcc onnxruntime scikit-learn pandas skl2onnx
-```
-
-#### 编译和运行
-```bash
-# 1. 编译eBPF程序
-clang -O2 -target bpf -c nfs_monitor.bpf.c -o nfs_monitor.o
-
-# 2. 训练初始模型 (可选)
-python ml_service.py --train
-
-# 3. 启动监控系统
-sudo python nfs_monitor_loader.py
-```
-
-#### 运行时控制
-```
-交互命令:
-  m: 切换ML功能开关
-  s: 显示统计信息
-  t: 训练新模型
-  r: 重置所有拦截规则
-  q: 退出
-```
-
-#### 功能演示
-1. **启动系统**:
-   ```
-   $ sudo python nfs_monitor_loader.py
-   编译和加载eBPF程序...
-   ML功能已开启
-   已附加LSM钩子: file_open -> nfs_file_open
-   ...
-   NFS安全监控系统已启动
-   基础防护层始终运行
-   机器学习层: 启用
-   按 'm' 键切换ML开关, 's' 查看统计, 'q' 退出
-   ```
-
-2. **触发安全事件**:
-   ```
-   [安全警报] 2023-10-15 14:30:22 UNLINK /etc/important.conf
-     原因: 非特权用户修改敏感文件
-     进程: crypt_tool(5678), 用户: user_1001
-     客户端: 192.168.1.100, 大小: 1024字节
-     添加临时拦截规则: inode=123456, 操作=UNLINK
-   ```
-
-3. **切换ML开关**:
-   ```
-   按 'm' 键
-   ML功能已关闭
-   ```
-
-4. **查看统计**:
-   ```
-   按 's' 键
-   
-   ===== 系统统计 =====
-   总事件数: 1245
-   ML处理事件: 845
-   检测异常: 12
-   添加规则: 8
-   
-   ===== ML模型统计 =====
-   总事件数: 845
-   异常事件数: 12
-   最后异常时间: 2023-10-15T14:30:22.123456
-   ```
 
 ### 关键特性
 
