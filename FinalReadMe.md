@@ -69,6 +69,7 @@
 
 - **LSM**
   - [Linux 安全 - LSM hook点](https://blog.csdn.net/weixin_45030965/article/details/133749748)
+  - [Head First eBPF](https://www.ebpf.top/post/lsm_bpf_intro/)
   - [Linux平台下基于动态属性的强制访问控制的设计与实现](https://kns.cnki.net/kcms2/article/abstract?v=zgUe5PvusG6KusGbF4ell8gcGU2sqXf-VIql7aglNj-yw9LaE2YiM8Jfu0QmzBRrzhNJk27fbHV54y1cfEQwqeaExpxY6fQcjp7uf5297s53Dox0AT1W4m6MWYa8kekfQgBoMEI2RlXGs9bKrJPCU4f4f5Id-aZV_fXZqI-zBnDlFiG0IPGNqNLR_5bIxQA2&uniplatform=NZKPT&language=CHS)
 
 - **机器学习**
