@@ -54,16 +54,9 @@
 
 ### 相关资料
 
-- **总体**
-  - [大赛官网](https://os.educg.net/#/sList?TYPE=2025OS_F)
-  - [proj108-eBPF-based-NFS](https://github.com/oscomp/proj108-eBPF-based-NFS)
-  - [proj293-Fault-Analysis-of-NFS-File-System-Based-on-eBPF](https://github.com/oscomp/proj293-Fault-Analysis-of-NFS-File-System-Based-on-eBPF)
-  - [中山大学获奖](https://gitlab.eduxiji.net/kytchett/project788067-87880)
-
 - **eBPF**
   - [eBPF 介绍](https://coolshell.cn/articles/22320.html)
   - [Linux eBPF 解析](https://coolshell.cn/articles/22320.html)
-  - [eBPF 在 Ubuntu 上安装](https://yaoyao.io/posts/how-to-setup-ebpf-env-on-ubuntu)
 
 - **NFS**
   - [NFS 介绍与使用](https://blog.csdn.net/mushuangpanny/article/details/127097977)
@@ -73,6 +66,14 @@
   - [Linux eBPF 和 XDP 高速处理数据包；使用 EBPF 编写 XDP 网络过滤器；高性能 ACL](https://blog.csdn.net/Rong_Toa/article/details/108993870)
   - [BPF and XDP Reference Guide](https://docs.cilium.io/en/stable/reference-guides/bpf/)
   - [基于 XDP/eBPF 的云网络数据面性能优化研究](https://kns.cnki.net/kcms2/article/abstract?v=uQzRnDzoTXG4vAL7nE3HusvhTTT98SPVDvkfuYoyAh4HEdeLiGAA1p1PXh5x-6_tTQ_04IAH7eUUJw7S-UFMUCec4qY6mhIpRNC--rkjlWR4UplFqegpLhERYACh11fSTbTvMVCRYW6Q-LyXmza_VuqrlLegjoRvucf70rtuTFQOfHjINvdUhYXpZVlpjNsK&uniplatform=NZKPT&language=CHS)
+
+- **LSM**
+  - [Linux 安全 - LSM hook点](https://blog.csdn.net/weixin_45030965/article/details/133749748)
+  - [Linux平台下基于动态属性的强制访问控制的设计与实现](https://kns.cnki.net/kcms2/article/abstract?v=zgUe5PvusG6KusGbF4ell8gcGU2sqXf-VIql7aglNj-yw9LaE2YiM8Jfu0QmzBRrzhNJk27fbHV54y1cfEQwqeaExpxY6fQcjp7uf5297s53Dox0AT1W4m6MWYa8kekfQgBoMEI2RlXGs9bKrJPCU4f4f5Id-aZV_fXZqI-zBnDlFiG0IPGNqNLR_5bIxQA2&uniplatform=NZKPT&language=CHS)
+
+- **机器学习**
+   -[Google Machine Learn](https://developers.google.cn/machine-learning/intro-to-ml?hl=zh-cn)
+  
 
 ## 三、XDP部分
 
