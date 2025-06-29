@@ -1,596 +1,1004 @@
 #include <linux/bpf.h>
+#include <linux/ptrace.h>
+#include <linux/security.h>
+#include <linux/nfs_fs.h>
+#include <linux/fs.h>
+#include <linux/dcache.h>
+#include <linux/path.h>
+#include <linux/mount.h>
+#include <linux/xattr.h>
+#include <linux/cred.h>
+#include <linux/sched.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 #include <bpf/bpf_core_read.h>
-#include <linux/fs.h>
-#include <linux/sched.h>
-#include <linux/fs_context.h>
-#include <linux/nfs_fs_sb.h>
-#include <linux/sunrpc/svc.h>
-#include <linux/lsm_hooks.h>
-#include <linux/cred.h>
-#include <linux/time.h>
-#include <linux/fdtable.h>
-#include <linux/nsproxy.h>
-#include <linux/utsname.h>
-#include <linux/timekeeping.h>
-#include <linux/pid_namespace.h>
-#include <net/sock.h>
-#include <net/net_namespace.h>
-#include <net/ip.h>
 
-/* ================= 常量定义 ================= */
 #define MAX_FILENAME_LEN 256
-#define MAX_CLIENT_IP_LEN 16
-#define MAX_PROCESS_NAME 16
-#define MAX_USERNAME_LEN 32
-#define MAX_PATH_LEN 512
+#define MAX_EVENTS 10240
+#define MAX_XATTR_NAME_LEN 64
+#define MAX_XATTR_VALUE_LEN 256
+#define NFS_SUPER_MAGIC 0x6969
 
-#define OPERATION_OPEN 0
-#define OPERATION_READ 1
-#define OPERATION_WRITE 2
-#define OPERATION_UNLINK 3
-#define OPERATION_SETATTR 4
-#define OPERATION_RENAME 5
-#define OPERATION_CREATE 6
-#define OPERATION_SYMLINK 7
+// 事件类型定义
+enum event_type {
+    EVENT_FILE_OPEN = 1,
+    EVENT_FILE_READ = 2,
+    EVENT_FILE_WRITE = 3,
+    EVENT_FILE_DELETE = 4,
+    EVENT_PERMISSION_DENIED = 5,
+    EVENT_INODE_PERMISSION = 6,
+    EVENT_FILE_PERMISSION = 7,
+    EVENT_SETATTR = 8,
+    EVENT_XATTR_SET = 9,
+    EVENT_XATTR_GET = 10,
+    EVENT_LINK_CREATE = 11,
+    EVENT_RENAME = 12,
+    EVENT_MKDIR = 13,
+    EVENT_RMDIR = 14,
+    EVENT_CREATE = 15,
+    EVENT_MOUNT = 16,
+    EVENT_REMOUNT = 17,
+    EVENT_STATFS = 18,
+    EVENT_MMAP = 19,
+    EVENT_MPROTECT = 20,
+    EVENT_EXEC_CHECK = 21,
+    EVENT_CRED_CHANGE = 22
+};
 
-#define BLOCK_RULE_PERMANENT 0
-#define BLOCK_RULE_TEMPORARY 1
+// 权限掩码定义
+#define MAY_EXEC 0x00000001
+#define MAY_WRITE 0x00000002
+#define MAY_READ 0x00000004
+#define MAY_APPEND 0x00000008
+#define MAY_ACCESS 0x00000010
+#define MAY_OPEN 0x00000020
+#define MAY_CHDIR 0x00000040
 
-/* ================= 数据结构定义 ================= */
-// ML特征数据结构
-struct ml_feature {
-    __u64 timestamp;
-    __u64 inode;
+// NFS访问事件结构
+struct nfs_event {
     __u32 pid;
     __u32 uid;
     __u32 gid;
-    __u32 operation;
-    __u32 access_flags;
-    __u32 file_size;
-    __u32 mode;
-    __u64 parent_inode;
-    __u64 session_id;
+    __u32 event_type;
+    __u64 timestamp;
     char filename[MAX_FILENAME_LEN];
-    char client_ip[MAX_CLIENT_IP_LEN];
-    char process_name[MAX_PROCESS_NAME];
-    char username[MAX_USERNAME_LEN];
-    char full_path[MAX_PATH_LEN];
+    __u32 file_size;
+    __u32 access_mode;
+    __u32 permission_mask;
+    __u32 client_ip;
+    __u16 client_port;
+    __u32 inode_number;
+    __u16 file_mode;
+    __u32 parent_inode;
+    char xattr_name[MAX_XATTR_NAME_LEN];
+    char target_path[MAX_FILENAME_LEN];
+    __u32 mount_flags;
+    __u32 security_flags;
 };
 
-// 拦截规则
-struct block_rule {
-    __u64 inode;
-    __u32 operation;
-    __u32 flags;
-    __u64 expire_time;
+// 安全策略配置
+struct security_policy {
+    __u32 enable_access_control;
+    __u32 enable_xattr_protection;
+    __u32 enable_exec_control;
+    __u32 enable_mount_control;
+    __u32 strict_mode;
+    __u32 log_level;
 };
 
-// 会话信息
-struct session_info {
-    __u64 start_time;
-    __u32 pid;
-    __u32 uid;
-    char client_ip[MAX_CLIENT_IP_LEN];
-    char init_process[MAX_PROCESS_NAME];
-};
-
-/* ================= eBPF Maps 定义 ================= */
-// ML开关状态Map (0=OFF, 1=ON)
+// ML开关状态
 struct {
     __uint(type, BPF_MAP_TYPE_ARRAY);
     __uint(max_entries, 1);
     __type(key, __u32);
     __type(value, __u32);
-} ml_switch SEC(".maps");
+} ml_switch_map SEC(".maps");
 
-// 动态拦截规则Map
+// 安全策略配置MAP
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 2048);
-    __type(key, struct block_rule);
-    __type(value, __u8);
-} block_rules SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct security_policy);
+} security_policy_map SEC(".maps");
 
-// 特征上报Ringbuf
-struct {
-    __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 2 * 1024 * 1024); // 2MB
-} ml_events SEC(".maps");
-
-// 基础事件上报Ringbuf
+// 事件环形缓冲区
 struct {
     __uint(type, BPF_MAP_TYPE_RINGBUF);
-    __uint(max_entries, 512 * 1024); // 512KB
-} base_events SEC(".maps");
+    __uint(max_entries, MAX_EVENTS * sizeof(struct nfs_event));
+} events SEC(".maps");
 
-// 会话Map (session_id -> session_info)
+// 拦截规则MAP
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __uint(max_entries, 1024);
-    __type(key, __u64);
-    __type(value, struct session_info);
-} sessions SEC(".maps");
+    __type(key, __u32);  // client_ip
+    __type(value, __u32); // 0=允许, 1=拒绝
+} intercept_rules SEC(".maps");
 
-// 文件路径缓存 (inode -> full_path)
+// 文件访问白名单
 struct {
-    __uint(type, BPF_MAP_TYPE_LRU_HASH);
-    __uint(max_entries, 4096);
-    __type(key, __u64);
-    __type(value, char[MAX_PATH_LEN]);
-} path_cache SEC(".maps");
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 2048);
+    __type(key, __u32);  // inode_number
+    __type(value, __u32); // 访问权限掩码
+} file_whitelist SEC(".maps");
 
-/* ================= 辅助函数 ================= */
-static __always_inline void get_process_name(struct task_struct *task, char *buf) {
-    bpf_probe_read_kernel_str(buf, MAX_PROCESS_NAME, task->comm);
-}
+// 用户权限映射
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);  // uid
+    __type(value, __u32); // 权限级别
+} user_permissions SEC(".maps");
 
-static __always_inline void get_client_ip(struct sock *sk, char *buf) {
-    struct sockaddr_in sin;
-    __builtin_memset(&sin, 0, sizeof(sin));
+// 敏感扩展属性列表
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 256);
+    __type(key, char[MAX_XATTR_NAME_LEN]);
+    __type(value, __u32); // 保护级别
+} sensitive_xattrs SEC(".maps");
+
+// 统计信息MAP
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);  // client_ip
+    __type(value, __u64); // 访问次数
+} access_stats SEC(".maps");
+
+// 违规统计MAP
+struct {
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 1024);
+    __type(key, __u32);  // client_ip
+    __type(value, __u64); // 违规次数
+} violation_stats SEC(".maps");
+
+// 辅助函数：检查是否为NFS文件系统
+static __always_inline bool is_nfs_filesystem(struct super_block *sb)
+{
+    if (!sb)
+        return false;
     
-    if (sk) {
-        sin.sin_addr.s_addr = BPF_CORE_READ(sk, __sk_common.skc_daddr);
-        long n = bpf_snprintf(buf, MAX_CLIENT_IP_LEN, "%pI4", &sin.sin_addr.s_addr);
-        if (n < 0) {
-            bpf_probe_read_kernel_str(buf, MAX_CLIENT_IP_LEN, "0.0.0.0");
-        }
-    } else {
-        bpf_probe_read_kernel_str(buf, MAX_CLIENT_IP_LEN, "0.0.0.0");
-    }
+    __u32 magic = BPF_CORE_READ(sb, s_magic);
+    return magic == NFS_SUPER_MAGIC;
 }
 
-static __always_inline bool should_block(__u64 inode, __u32 operation) {
-    struct block_rule key = {
-        .inode = inode,
-        .operation = operation
-    };
+// 辅助函数：获取客户端IP地址
+static __always_inline __u32 get_client_ip(void)
+{
+    // 实际实现需要从网络栈或NFS上下文中获取
+    // 这里简化处理，实际需要根据NFS服务器实现
+    return 0x7f000001; // 127.0.0.1 for testing
+}
+
+// 辅助函数：检查拦截规则
+static __always_inline bool check_intercept_rule(__u32 client_ip)
+{
+    __u32 *rule = bpf_map_lookup_elem(&intercept_rules, &client_ip);
+    return rule && *rule == 1;
+}
+
+// 辅助函数：获取安全策略
+static __always_inline struct security_policy* get_security_policy(void)
+{
+    __u32 key = 0;
+    return bpf_map_lookup_elem(&security_policy_map, &key);
+}
+
+// 辅助函数：记录事件
+static __always_inline void record_event(struct nfs_event *event)
+{
+    struct nfs_event *e;
     
-    // 查找永久规则
-    __u8 *block_type = bpf_map_lookup_elem(&block_rules, &key);
-    if (block_type) {
-        if (*block_type == BLOCK_RULE_PERMANENT) {
-            return true;
-        }
-        
-        // 检查临时规则是否过期
-        if (key.expire_time > 0) {
-            __u64 now = bpf_ktime_get_ns();
-            if (now < key.expire_time) {
-                return true;
-            }
-            // 过期规则自动删除
-            bpf_map_delete_elem(&block_rules, &key);
-        }
-    }
-    return false;
-}
-
-static __always_inline void get_full_path(struct dentry *dentry, char *buf) {
-    // 尝试从缓存获取路径
-    __u64 inode = dentry->d_inode->i_ino;
-    char *cached_path = bpf_map_lookup_elem(&path_cache, &inode);
-    if (cached_path) {
-        bpf_probe_read_kernel_str(buf, MAX_PATH_LEN, cached_path);
+    e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e)
         return;
+    
+    __builtin_memcpy(e, event, sizeof(*e));
+    bpf_ringbuf_submit(e, 0);
+}
+
+// 辅助函数：更新统计信息
+static __always_inline void update_stats(__u32 client_ip, bool is_violation)
+{
+    __u64 *count;
+    
+    // 更新访问统计
+    count = bpf_map_lookup_elem(&access_stats, &client_ip);
+    if (count) {
+        __sync_fetch_and_add(count, 1);
+    } else {
+        __u64 init_count = 1;
+        bpf_map_update_elem(&access_stats, &client_ip, &init_count, BPF_ANY);
     }
     
-    // 动态构建路径
-    struct dentry *parent;
-    char tmp_path[MAX_PATH_LEN] = {0};
-    char component[MAX_FILENAME_LEN];
-    int depth = 0;
-    
-    // 从当前dentry向上遍历
-    for (int i = 0; i < 16; i++) { // 防止无限循环
-        if (!dentry || depth >= MAX_PATH_LEN - 1) break;
-        
-        // 获取当前dentry名称
-        bpf_probe_read_kernel_str(component, MAX_FILENAME_LEN, dentry->d_name.name);
-        int len = bpf_strnlen(component, MAX_FILENAME_LEN);
-        
-        // 检查是否根目录
-        if (dentry == dentry->d_parent) {
-            if (len > 0) {
-                bpf_probe_read_user_str(buf, MAX_PATH_LEN, component);
-            } else {
-                bpf_probe_read_user_str(buf, MAX_PATH_LEN, "/");
-            }
-            break;
-        }
-        
-        // 构建路径
-        if (depth == 0) {
-            bpf_probe_read_user_str(tmp_path, MAX_PATH_LEN, component);
+    // 更新违规统计
+    if (is_violation) {
+        count = bpf_map_lookup_elem(&violation_stats, &client_ip);
+        if (count) {
+            __sync_fetch_and_add(count, 1);
         } else {
-            char new_path[MAX_PATH_LEN];
-            bpf_snprintf(new_path, MAX_PATH_LEN, "%s/%s", component, tmp_path);
-            bpf_probe_read_user_str(tmp_path, MAX_PATH_LEN, new_path);
+            __u64 init_count = 1;
+            bpf_map_update_elem(&violation_stats, &client_ip, &init_count, BPF_ANY);
         }
-        depth++;
-        
-        // 移动到父目录
-        parent = dentry->d_parent;
-        if (!parent) break;
-        dentry = parent;
-    }
-    
-    // 复制到输出缓冲区
-    bpf_probe_read_kernel_str(buf, MAX_PATH_LEN, tmp_path);
-    
-    // 更新缓存
-    char path_to_cache[MAX_PATH_LEN];
-    bpf_probe_read_kernel_str(path_to_cache, MAX_PATH_LEN, buf);
-    bpf_map_update_elem(&path_cache, &inode, path_to_cache, BPF_ANY);
-}
-
-static __always_inline __u64 get_session_id(struct task_struct *task) {
-    // 使用进程的start_time和pid组合作为会话ID
-    __u64 start_time = BPF_CORE_READ(task, start_time);
-    return start_time + BPF_CORE_READ(task, pid);
-}
-
-static __always_inline void get_username(struct task_struct *task, char *buf) {
-    struct cred *cred = BPF_CORE_READ(task, cred);
-    kuid_t uid = BPF_CORE_READ(cred, uid);
-    
-    // 在实际系统中应查询用户数据库，这里简化为使用UID
-    long n = bpf_snprintf(buf, MAX_USERNAME_LEN, "user_%u", uid.val);
-    if (n < 0) {
-        bpf_probe_read_kernel_str(buf, MAX_USERNAME_LEN, "unknown");
     }
 }
 
-/* ================= LSM 钩子实现 ================= */
-SEC("lsm/file_open")
-int BPF_PROG(nfs_file_open, struct file *file) {
-    __u64 inode = file->f_inode->i_ino;
-    __u32 operation = OPERATION_OPEN;
+// 辅助函数：检查用户权限
+static __always_inline bool check_user_permission(__u32 uid, __u32 required_level)
+{
+    __u32 *user_level = bpf_map_lookup_elem(&user_permissions, &uid);
+    if (!user_level)
+        return false;
     
-    // 基础层检查
-    if (should_block(inode, operation)) {
+    return *user_level >= required_level;
+}
+
+// LSM钩子：inode权限检查
+SEC("lsm/inode_permission")
+int BPF_PROG(nfs_inode_permission, struct inode *inode, int mask)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    __u32 inode_num;
+    __u32 *whitelist_mask;
+    
+    if (!inode || !inode->i_sb)
+        return 0;
+    
+    // 检查是否为NFS文件系统
+    if (!is_nfs_filesystem(inode->i_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 检查拦截规则
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
         return -EACCES;
     }
     
-    // 获取当前任务
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-    
-    // 检查ML开关状态
-    __u32 key = 0;
-    __u32 *ml_enabled = bpf_map_lookup_elem(&ml_switch, &key);
-    if (ml_enabled && *ml_enabled) {
-        // 分配特征结构
-        struct ml_feature *feature = bpf_ringbuf_reserve(&ml_events, sizeof(*feature), 0);
-        if (!feature) return 0;
-        
-        // 填充特征数据
-        feature->timestamp = bpf_ktime_get_ns();
-        feature->inode = inode;
-        feature->pid = BPF_CORE_READ(task, pid);
-        feature->uid = BPF_CORE_READ(task, cred)->uid.val;
-        feature->gid = BPF_CORE_READ(task, cred)->gid.val;
-        feature->operation = operation;
-        feature->file_size = file->f_inode->i_size;
-        feature->mode = file->f_inode->i_mode;
-        feature->access_flags = file->f_flags;
-        feature->parent_inode = 0;
-        feature->session_id = get_session_id(task);
-        
-        // 获取文件名和路径
-        bpf_probe_read_kernel_str(feature->filename, MAX_FILENAME_LEN, 
-                   file->f_path.dentry->d_name.name);
-        get_full_path(file->f_path.dentry, feature->full_path);
-        
-        // 获取客户端IP和进程信息
-        struct socket *sock = BPF_CORE_READ(file, f_path.dentry->d_sb, s_fs_info);
-        struct sock *sk = sock ? BPF_CORE_READ(sock, sk) : NULL;
-        get_client_ip(sk, feature->client_ip);
-        get_process_name(task, feature->process_name);
-        get_username(task, feature->username);
-        
-        // 更新会话信息
-        struct session_info *session = bpf_map_lookup_elem(&sessions, &feature->session_id);
-        if (!session) {
-            struct session_info new_session = {
-                .start_time = feature->timestamp,
-                .pid = feature->pid,
-                .uid = feature->uid
-            };
-            bpf_probe_read_kernel_str(new_session.client_ip, MAX_CLIENT_IP_LEN, feature->client_ip);
-            bpf_probe_read_kernel_str(new_session.init_process, MAX_PROCESS_NAME, feature->process_name);
-            bpf_map_update_elem(&sessions, &feature->session_id, &new_session, BPF_ANY);
-        }
-        
-        bpf_ringbuf_submit(feature, 0);
-    } else {
-        // ML关闭：仅上报基础事件
-        struct ml_feature *base_event = bpf_ringbuf_reserve(&base_events, sizeof(struct ml_feature), 0);
-        if (base_event) {
-            base_event->timestamp = bpf_ktime_get_ns();
-            base_event->inode = inode;
-            base_event->operation = operation;
-            bpf_probe_read_kernel_str(base_event->filename, MAX_FILENAME_LEN, 
-                       file->f_path.dentry->d_name.name);
-            bpf_ringbuf_submit(base_event, 0);
-        }
+    // 检查文件白名单
+    inode_num = BPF_CORE_READ(inode, i_ino);
+    whitelist_mask = bpf_map_lookup_elem(&file_whitelist, &inode_num);
+    if (whitelist_mask && (mask & *whitelist_mask) != mask) {
+        // 请求的权限超出白名单允许范围
+        event.event_type = EVENT_PERMISSION_DENIED;
+        event.inode_number = inode_num;
+        event.permission_mask = mask;
+        event.client_ip = client_ip;
+        event.timestamp = bpf_ktime_get_ns();
+        record_event(&event);
+        update_stats(client_ip, true);
+        return -EACCES;
     }
+    
+    // 记录正常访问
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.gid = bpf_get_current_uid_gid() >> 32;
+    event.event_type = EVENT_INODE_PERMISSION;
+    event.timestamp = bpf_ktime_get_ns();
+    event.inode_number = inode_num;
+    event.permission_mask = mask;
+    event.client_ip = client_ip;
+    
+    record_event(&event);
+    update_stats(client_ip, false);
     
     return 0;
 }
 
-// 文件删除操作
-SEC("lsm/inode_unlink")
-int BPF_PROG(nfs_unlink, struct inode *dir, struct dentry *dentry) {
-    __u64 inode = dentry->d_inode->i_ino;
-    __u32 operation = OPERATION_UNLINK;
+// LSM钩子：文件权限检查
+SEC("lsm/file_permission")
+int BPF_PROG(nfs_file_permission, struct file *file, int mask)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
     
-    // 基础层检查
-    if (should_block(inode, operation)) {
-        return -EPERM;
+    if (!file || !file->f_inode)
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        event.event_type = EVENT_PERMISSION_DENIED;
+        event.client_ip = client_ip;
+        event.timestamp = bpf_ktime_get_ns();
+        record_event(&event);
+        update_stats(client_ip, true);
+        return -EACCES;
     }
     
-    // 获取当前任务
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // 记录文件权限检查
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_FILE_PERMISSION;
+    event.timestamp = bpf_ktime_get_ns();
+    event.permission_mask = mask;
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(file->f_inode, i_ino);
     
-    // 检查ML开关状态
-    __u32 key = 0;
-    __u32 *ml_enabled = bpf_map_lookup_elem(&ml_switch, &key);
-    if (ml_enabled && *ml_enabled) {
-        // 分配特征结构
-        struct ml_feature *feature = bpf_ringbuf_reserve(&ml_events, sizeof(*feature), 0);
-        if (!feature) return 0;
-        
-        // 填充特征数据
-        feature->timestamp = bpf_ktime_get_ns();
-        feature->inode = inode;
-        feature->pid = BPF_CORE_READ(task, pid);
-        feature->uid = BPF_CORE_READ(task, cred)->uid.val;
-        feature->gid = BPF_CORE_READ(task, cred)->gid.val;
-        feature->operation = operation;
-        feature->file_size = dentry->d_inode->i_size;
-        feature->mode = dentry->d_inode->i_mode;
-        feature->parent_inode = dir->i_ino;
-        feature->session_id = get_session_id(task);
-        
-        // 获取文件名和路径
-        bpf_probe_read_kernel_str(feature->filename, MAX_FILENAME_LEN, dentry->d_name.name);
-        get_full_path(dentry, feature->full_path);
-        
-        // 获取客户端IP和进程信息
-        struct socket *sock = BPF_CORE_READ(dentry->d_sb, s_fs_info);
-        struct sock *sk = sock ? BPF_CORE_READ(sock, sk) : NULL;
-        get_client_ip(sk, feature->client_ip);
-        get_process_name(task, feature->process_name);
-        get_username(task, feature->username);
-        
-        bpf_ringbuf_submit(feature, 0);
-    } else {
-        // 仅上报基础事件
-        struct ml_feature *base_event = bpf_ringbuf_reserve(&base_events, sizeof(struct ml_feature), 0);
-        if (base_event) {
-            base_event->timestamp = bpf_ktime_get_ns();
-            base_event->inode = inode;
-            base_event->operation = operation;
-            bpf_probe_read_kernel_str(base_event->filename, MAX_FILENAME_LEN, dentry->d_name.name);
-            bpf_ringbuf_submit(base_event, 0);
-        }
-    }
+    record_event(&event);
+    update_stats(client_ip, false);
     
     return 0;
 }
 
-// 文件属性变更
+// LSM钩子：文件打开
+SEC("lsm/file_open")
+int BPF_PROG(nfs_file_open, struct file *file)
+{
+    struct nfs_event event = {};
+    struct dentry *dentry;
+    const char *filename;
+    __u32 client_ip;
+    
+    if (!file || !file->f_path.dentry)
+        return 0;
+    
+    dentry = file->f_path.dentry;
+    if (!dentry || !dentry->d_sb || !is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
+        return -EACCES;
+    }
+    
+    // 填充事件信息
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.gid = bpf_get_current_uid_gid() >> 32;
+    event.event_type = EVENT_FILE_OPEN;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.access_mode = file->f_mode;
+    event.inode_number = BPF_CORE_READ(file->f_inode, i_ino);
+    
+    filename = BPF_CORE_READ(dentry, d_name.name);
+    if (filename) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, filename);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：设置inode属性
 SEC("lsm/inode_setattr")
-int BPF_PROG(nfs_setattr, struct dentry *dentry, struct iattr *attr) {
-    __u64 inode = dentry->d_inode->i_ino;
-    __u32 operation = OPERATION_SETATTR;
+int BPF_PROG(nfs_inode_setattr, struct dentry *dentry, struct iattr *attr)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    const char *filename;
     
-    // 基础层检查
-    if (should_block(inode, operation)) {
+    if (!dentry || !dentry->d_inode)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 检查是否有权限修改属性
+    __u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    if (policy->strict_mode && !check_user_permission(uid, 2)) {
+        update_stats(client_ip, true);
         return -EPERM;
     }
     
-    // 获取当前任务
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // 记录属性修改事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = uid;
+    event.gid = bpf_get_current_uid_gid() >> 32;
+    event.event_type = EVENT_SETATTR;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(dentry->d_inode, i_ino);
     
-    // 检查ML开关状态
-    __u32 key = 0;
-    __u32 *ml_enabled = bpf_map_lookup_elem(&ml_switch, &key);
-    if (ml_enabled && *ml_enabled) {
-        // 分配特征结构
-        struct ml_feature *feature = bpf_ringbuf_reserve(&ml_events, sizeof(*feature), 0);
-        if (!feature) return 0;
-        
-        // 填充特征数据
-        feature->timestamp = bpf_ktime_get_ns();
-        feature->inode = inode;
-        feature->pid = BPF_CORE_READ(task, pid);
-        feature->uid = BPF_CORE_READ(task, cred)->uid.val;
-        feature->gid = BPF_CORE_READ(task, cred)->gid.val;
-        feature->operation = operation;
-        feature->file_size = dentry->d_inode->i_size;
-        feature->mode = attr->ia_mode;
-        feature->parent_inode = 0;
-        feature->session_id = get_session_id(task);
-        
-        // 获取文件名和路径
-        bpf_probe_read_kernel_str(feature->filename, MAX_FILENAME_LEN, dentry->d_name.name);
-        get_full_path(dentry, feature->full_path);
-        
-        // 获取客户端IP和进程信息
-        struct socket *sock = BPF_CORE_READ(dentry->d_sb, s_fs_info);
-        struct sock *sk = sock ? BPF_CORE_READ(sock, sk) : NULL;
-        get_client_ip(sk, feature->client_ip);
-        get_process_name(task, feature->process_name);
-        get_username(task, feature->username);
-        
-        bpf_ringbuf_submit(feature, 0);
+    filename = BPF_CORE_READ(dentry, d_name.name);
+    if (filename) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, filename);
     }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
     
     return 0;
 }
 
-// 文件创建操作
+// LSM钩子：设置扩展属性
+SEC("lsm/inode_setxattr")
+int BPF_PROG(nfs_inode_setxattr, struct dentry *dentry, const char *name,
+             const void *value, size_t size, int flags)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    __u32 *protection_level;
+    
+    if (!dentry || !name)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_xattr_protection)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 检查是否为敏感扩展属性
+    char xattr_name[MAX_XATTR_NAME_LEN] = {};
+    bpf_probe_read_kernel_str(xattr_name, MAX_XATTR_NAME_LEN, name);
+    
+    protection_level = bpf_map_lookup_elem(&sensitive_xattrs, &xattr_name);
+    if (protection_level && *protection_level > 0) {
+        __u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+        if (!check_user_permission(uid, *protection_level)) {
+            update_stats(client_ip, true);
+            return -EPERM;
+        }
+    }
+    
+    // 记录扩展属性设置事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_XATTR_SET;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(dentry->d_inode, i_ino);
+    
+    __builtin_memcpy(event.xattr_name, xattr_name, MAX_XATTR_NAME_LEN);
+    
+    const char *filename = BPF_CORE_READ(dentry, d_name.name);
+    if (filename) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, filename);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：获取扩展属性
+SEC("lsm/inode_getxattr")
+int BPF_PROG(nfs_inode_getxattr, struct dentry *dentry, const char *name)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!dentry || !name)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_xattr_protection)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 记录扩展属性获取事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_XATTR_GET;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(dentry->d_inode, i_ino);
+    
+    bpf_probe_read_kernel_str(event.xattr_name, MAX_XATTR_NAME_LEN, name);
+    
+    const char *filename = BPF_CORE_READ(dentry, d_name.name);
+    if (filename) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, filename);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：创建硬链接
+SEC("lsm/path_link")
+int BPF_PROG(nfs_path_link, struct dentry *old_dentry, struct path *new_dir,
+             struct dentry *new_dentry)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!old_dentry || !new_dentry)
+        return 0;
+    
+    if (!is_nfs_filesystem(old_dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
+        return -EACCES;
+    }
+    
+    // 记录硬链接创建事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_LINK_CREATE;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(old_dentry->d_inode, i_ino);
+    
+    const char *old_name = BPF_CORE_READ(old_dentry, d_name.name);
+    if (old_name) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, old_name);
+    }
+    
+    const char *new_name = BPF_CORE_READ(new_dentry, d_name.name);
+    if (new_name) {
+        bpf_probe_read_kernel_str(event.target_path, MAX_FILENAME_LEN, new_name);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：重命名/移动
+SEC("lsm/path_rename")
+int BPF_PROG(nfs_path_rename, struct path *old_dir, struct dentry *old_dentry,
+             struct path *new_dir, struct dentry *new_dentry)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!old_dentry || !new_dentry)
+        return 0;
+    
+    if (!is_nfs_filesystem(old_dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
+        return -EACCES;
+    }
+    
+    // 记录重命名事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_RENAME;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(old_dentry->d_inode, i_ino);
+    
+    const char *old_name = BPF_CORE_READ(old_dentry, d_name.name);
+    if (old_name) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, old_name);
+    }
+    
+    const char *new_name = BPF_CORE_READ(new_dentry, d_name.name);
+    if (new_name) {
+        bpf_probe_read_kernel_str(event.target_path, MAX_FILENAME_LEN, new_name);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：创建目录
+SEC("lsm/path_mkdir")
+int BPF_PROG(nfs_path_mkdir, struct path *dir, struct dentry *dentry, umode_t mode)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!dentry)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
+        return -EACCES;
+    }
+    
+    // 记录目录创建事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_MKDIR;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.file_mode = mode;
+    
+    const char *dirname = BPF_CORE_READ(dentry, d_name.name);
+    if (dirname) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, dirname);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：删除目录
+SEC("lsm/path_rmdir")
+int BPF_PROG(nfs_path_rmdir, struct path *dir, struct dentry *dentry)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!dentry)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
+        return -EACCES;
+    }
+    
+    // 记录目录删除事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_RMDIR;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(dentry->d_inode, i_ino);
+    
+    const char *dirname = BPF_CORE_READ(dentry, d_name.name);
+    if (dirname) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, dirname);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：删除文件
+SEC("lsm/inode_unlink")
+int BPF_PROG(nfs_inode_unlink, struct inode *dir, struct dentry *dentry)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!dentry)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
+        return -EACCES;
+    }
+    
+    // 记录文件删除事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.gid = bpf_get_current_uid_gid() >> 32;
+    event.event_type = EVENT_FILE_DELETE;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(dentry->d_inode, i_ino);
+    
+    const char *filename = BPF_CORE_READ(dentry, d_name.name);
+    if (filename) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, filename);
+    }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：创建文件
 SEC("lsm/inode_create")
-int BPF_PROG(nfs_create, struct inode *dir, struct dentry *dentry, umode_t mode) {
-    __u64 inode = 0; // 新文件，inode尚未分配
-    __u32 operation = OPERATION_CREATE;
+int BPF_PROG(nfs_inode_create, struct inode *dir, struct dentry *dentry, umode_t mode)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
     
-    // 基础层检查
-    if (should_block(dir->i_ino, operation)) {
-        return -EPERM;
+    if (!dentry)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_access_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    if (check_intercept_rule(client_ip)) {
+        update_stats(client_ip, true);
+        return -EACCES;
     }
     
-    // 获取当前任务
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // 记录文件创建事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_CREATE;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.file_mode = mode;
     
-    // 检查ML开关状态
-    __u32 key = 0;
-    __u32 *ml_enabled = bpf_map_lookup_elem(&ml_switch, &key);
-    if (ml_enabled && *ml_enabled) {
-        // 分配特征结构
-        struct ml_feature *feature = bpf_ringbuf_reserve(&ml_events, sizeof(*feature), 0);
-        if (!feature) return 0;
-        
-        // 填充特征数据
-        feature->timestamp = bpf_ktime_get_ns();
-        feature->inode = 0;
-        feature->pid = BPF_CORE_READ(task, pid);
-        feature->uid = BPF_CORE_READ(task, cred)->uid.val;
-        feature->gid = BPF_CORE_READ(task, cred)->gid.val;
-        feature->operation = operation;
-        feature->file_size = 0;
-        feature->mode = mode;
-        feature->parent_inode = dir->i_ino;
-        feature->session_id = get_session_id(task);
-        
-        // 获取文件名和路径
-        bpf_probe_read_kernel_str(feature->filename, MAX_FILENAME_LEN, dentry->d_name.name);
-        get_full_path(dentry, feature->full_path);
-        
-        // 获取客户端IP和进程信息
-        struct socket *sock = BPF_CORE_READ(dentry->d_sb, s_fs_info);
-        struct sock *sk = sock ? BPF_CORE_READ(sock, sk) : NULL;
-        get_client_ip(sk, feature->client_ip);
-        get_process_name(task, feature->process_name);
-        get_username(task, feature->username);
-        
-        bpf_ringbuf_submit(feature, 0);
+    const char *filename = BPF_CORE_READ(dentry, d_name.name);
+    if (filename) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, filename);
     }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
     
     return 0;
 }
 
-// 符号链接操作
-SEC("lsm/inode_symlink")
-int BPF_PROG(nfs_symlink, struct inode *dir, struct dentry *dentry, const char *oldname) {
-    __u64 inode = 0; // 新文件，inode尚未分配
-    __u32 operation = OPERATION_SYMLINK;
+// LSM钩子：挂载文件系统
+SEC("lsm/sb_mount")
+int BPF_PROG(nfs_sb_mount, const char *dev_name, struct path *path,
+             const char *type, unsigned long flags, void *data)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
     
-    // 基础层检查
-    if (should_block(dir->i_ino, operation)) {
+    policy = get_security_policy();
+    if (!policy || !policy->enable_mount_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 检查挂载权限
+    __u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    if (policy->strict_mode && !check_user_permission(uid, 3)) {
+        update_stats(client_ip, true);
         return -EPERM;
     }
     
-    // 获取当前任务
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // 记录挂载事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = uid;
+    event.event_type = EVENT_MOUNT;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.mount_flags = flags;
     
-    // 检查ML开关状态
-    __u32 key = 0;
-    __u32 *ml_enabled = bpf_map_lookup_elem(&ml_switch, &key);
-    if (ml_enabled && *ml_enabled) {
-        // 分配特征结构
-        struct ml_feature *feature = bpf_ringbuf_reserve(&ml_events, sizeof(*feature), 0);
-        if (!feature) return 0;
-        
-        // 填充特征数据
-        feature->timestamp = bpf_ktime_get_ns();
-        feature->inode = 0;
-        feature->pid = BPF_CORE_READ(task, pid);
-        feature->uid = BPF_CORE_READ(task, cred)->uid.val;
-        feature->gid = BPF_CORE_READ(task, cred)->gid.val;
-        feature->operation = operation;
-        feature->file_size = 0;
-        feature->mode = S_IFLNK; // 符号链接
-        feature->parent_inode = dir->i_ino;
-        feature->session_id = get_session_id(task);
-        
-        // 获取文件名和路径
-        bpf_probe_read_kernel_str(feature->filename, MAX_FILENAME_LEN, dentry->d_name.name);
-        get_full_path(dentry, feature->full_path);
-        
-        // 获取目标链接
-        bpf_probe_read_kernel_str(feature->username, MAX_USERNAME_LEN, oldname);
-        
-        // 获取客户端IP和进程信息
-        struct socket *sock = BPF_CORE_READ(dentry->d_sb, s_fs_info);
-        struct sock *sk = sock ? BPF_CORE_READ(sock, sk) : NULL;
-        get_client_ip(sk, feature->client_ip);
-        get_process_name(task, feature->process_name);
-        get_username(task, feature->username);
-        
-        bpf_ringbuf_submit(feature, 0);
+    if (dev_name) {
+        bpf_probe_read_kernel_str(event.filename, MAX_FILENAME_LEN, dev_name);
     }
+    
+    record_event(&event);
+    update_stats(client_ip, false);
     
     return 0;
 }
 
-// 文件重命名操作
-SEC("lsm/inode_rename")
-int BPF_PROG(nfs_rename, struct inode *old_dir, struct dentry *old_dentry,
-             struct inode *new_dir, struct dentry *new_dentry) {
-    __u64 inode = old_dentry->d_inode->i_ino;
-    __u32 operation = OPERATION_RENAME;
+// LSM钩子：重新挂载文件系统
+SEC("lsm/sb_remount")
+int BPF_PROG(nfs_sb_remount, struct super_block *sb, void *data)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
     
-    // 基础层检查
-    if (should_block(inode, operation)) {
+    policy = get_security_policy();
+    if (!policy || !policy->enable_mount_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 检查重新挂载权限
+    __u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    if (policy->strict_mode && !check_user_permission(uid, 3)) {
+        update_stats(client_ip, true);
         return -EPERM;
     }
     
-    // 获取当前任务
-    struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+    // 记录重新挂载事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = uid;
+    event.event_type = EVENT_REMOUNT;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
     
-    // 检查ML开关状态
-    __u32 key = 0;
-    __u32 *ml_enabled = bpf_map_lookup_elem(&ml_switch, &key);
-    if (ml_enabled && *ml_enabled) {
-        // 分配特征结构
-        struct ml_feature *feature = bpf_ringbuf_reserve(&ml_events, sizeof(*feature), 0);
-        if (!feature) return 0;
-        
-        // 填充特征数据
-        feature->timestamp = bpf_ktime_get_ns();
-        feature->inode = inode;
-        feature->pid = BPF_CORE_READ(task, pid);
-        feature->uid = BPF_CORE_READ(task, cred)->uid.val;
-        feature->gid = BPF_CORE_READ(task, cred)->gid.val;
-        feature->operation = operation;
-        feature->file_size = old_dentry->d_inode->i_size;
-        feature->mode = old_dentry->d_inode->i_mode;
-        feature->parent_inode = old_dir->i_ino;
-        feature->session_id = get_session_id(task);
-        
-        // 获取文件名和路径
-        bpf_probe_read_kernel_str(feature->filename, MAX_FILENAME_LEN, old_dentry->d_name.name);
-        get_full_path(old_dentry, feature->full_path);
-        
-        // 存储新路径在username字段中
-        char new_path[MAX_PATH_LEN];
-        get_full_path(new_dentry, new_path);
-        bpf_probe_read_kernel_str(feature->username, MAX_USERNAME_LEN, new_path);
-        
-        // 获取客户端IP和进程信息
-        struct socket *sock = BPF_CORE_READ(old_dentry->d_sb, s_fs_info);
-        struct sock *sk = sock ? BPF_CORE_READ(sock, sk) : NULL;
-        get_client_ip(sk, feature->client_ip);
-        get_process_name(task, feature->process_name);
-        get_username(task, feature->username); // 覆盖新路径，仅用于演示
-        
-        bpf_ringbuf_submit(feature, 0);
-    }
+    record_event(&event);
+    update_stats(client_ip, false);
     
     return 0;
 }
 
-char _license[] SEC("license") = "GPL";
+// LSM钩子：获取文件系统统计信息
+SEC("lsm/sb_statfs")
+int BPF_PROG(nfs_sb_statfs, struct dentry *dentry)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!dentry)
+        return 0;
+    
+    if (!is_nfs_filesystem(dentry->d_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || policy->log_level < 2)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 记录统计信息查询事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_STATFS;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：内存映射文件
+SEC("lsm/mmap_file")
+int BPF_PROG(nfs_mmap_file, struct file *file, unsigned long reqprot,
+             unsigned long prot, unsigned long flags)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!file || !file->f_inode)
+        return 0;
+    
+    if (!is_nfs_filesystem(file->f_inode->i_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_exec_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 检查可执行映射权限
+    if ((prot & PROT_EXEC) && policy->strict_mode) {
+        __u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+        if (!check_user_permission(uid, 2)) {
+            update_stats(client_ip, true);
+            return -EPERM;
+        }
+    }
+    
+    // 记录内存映射事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_MMAP;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(file->f_inode, i_ino);
+    event.security_flags = prot;
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+// LSM钩子：内存保护修改
+SEC("lsm/file_mprotect")
+int BPF_PROG(nfs_file_mprotect, struct vm_area_struct *vma, unsigned long reqprot,
+             unsigned long prot)
+{
+    struct nfs_event event = {};
+    struct security_policy *policy;
+    __u32 client_ip;
+    
+    if (!vma || !vma->vm_file || !vma->vm_file->f_inode)
+        return 0;
+    
+    if (!is_nfs_filesystem(vma->vm_file->f_inode->i_sb))
+        return 0;
+    
+    policy = get_security_policy();
+    if (!policy || !policy->enable_exec_control)
+        return 0;
+    
+    client_ip = get_client_ip();
+    
+    // 检查执行权限修改
+    if ((prot & PROT_EXEC) && !(reqprot & PROT_EXEC)) {
+        __u32 uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+        if (policy->strict_mode && !check_user_permission(uid, 2)) {
+            update_stats(client_ip, true);
+            return -EPERM;
+        }
+    }
+    
+    // 记录内存保护修改事件
+    event.pid = bpf_get_current_pid_tgid() >> 32;
+    event.uid = bpf_get_current_uid_gid() & 0xFFFFFFFF;
+    event.event_type = EVENT_MPROTECT;
+    event.timestamp = bpf_ktime_get_ns();
+    event.client_ip = client_ip;
+    event.inode_number = BPF_CORE_READ(vma->vm_file->f_inode, i_ino);
+    event.security_flags = prot;
+    
+    record_event(&event);
+    update_stats(client_ip, false);
+    
+    return 0;
+}
+
+char LICENSE[] SEC("license") = "GPL";
