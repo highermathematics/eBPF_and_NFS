@@ -9,7 +9,7 @@
 
 ### 设计思路：
 
-#### 1. 核心架构概览
+#### 1. 核心架构概览:
 
 该项目构建一个基于 eBPF 的高性能安全 NFS 系统，采用三层处理架构：
 
@@ -31,9 +31,9 @@
 - 在 XDP 层集成过滤规则，对恶意 IP、异常流量（如高频访问）或越权操作（如非法文件访问）直接丢弃数据包。
 - 结合 eBPF 的统计能力，使用lsm钩子技术与机器学习大模型分析技术结合的方式，实时分析 NFS 操作行为（如读写比例），动态调整安全策略（如限制特定用户的文件操作范围）。
 
-#### 4. OpenEuler 集成
+#### 4. OpenEuler 集成:
 
-#### 5. 阶段目标
+### 阶段目标:
 
 #### 阶段 1：基础 NFS 功能 + 简单 eBPF 加速
 - 实现基本的XDP 数据包捕获
@@ -72,7 +72,7 @@
   - [Linux平台下基于动态属性的强制访问控制的设计与实现](https://kns.cnki.net/kcms2/article/abstract?v=zgUe5PvusG6KusGbF4ell8gcGU2sqXf-VIql7aglNj-yw9LaE2YiM8Jfu0QmzBRrzhNJk27fbHV54y1cfEQwqeaExpxY6fQcjp7uf5297s53Dox0AT1W4m6MWYa8kekfQgBoMEI2RlXGs9bKrJPCU4f4f5Id-aZV_fXZqI-zBnDlFiG0IPGNqNLR_5bIxQA2&uniplatform=NZKPT&language=CHS)
 
 - **机器学习**
-   -[Google Machine Learn](https://developers.google.cn/machine-learning/intro-to-ml?hl=zh-cn)
+   - [Google Machine Learn](https://developers.google.cn/machine-learning/intro-to-ml?hl=zh-cn)
   
 
 ## 三、XDP部分
