@@ -241,3 +241,5 @@ sequenceDiagram
 - **ml status**: 查看ML服务状态
 - **export**: 导出数据
 - **help**: 帮助信息
+
+## 五、OpenEuler 适配
