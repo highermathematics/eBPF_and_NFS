@@ -819,4 +819,8 @@ def main():
         sys.exit(1)
 
 if __name__ == '__main__':
+<<<<<<< HEAD
     main()
+=======
+    main()
+>>>>>>> 86c1b21b2c3a5f694b58720539ac6f0bb13a39f3

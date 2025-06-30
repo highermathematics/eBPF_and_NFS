@@ -1001,4 +1001,8 @@ int BPF_PROG(nfs_file_mprotect, struct vm_area_struct *vma, unsigned long reqpro
     return 0;
 }
 
+<<<<<<< HEAD
 char LICENSE[] SEC("license") = "GPL";
+=======
+char LICENSE[] SEC("license") = "GPL";
+>>>>>>> 86c1b21b2c3a5f694b58720539ac6f0bb13a39f3
