@@ -1,0 +1,11 @@
+client_ip,operation_type,file_path,access_time,file_size,operation_count,read_bytes,write_bytes,error_count,response_time,uid,gid,access_pattern,frequency
+192.168.1.200,READ,/etc/passwd,1641086400,1500,1,1500,0,0,0.03,1000,1000,sequential,low
+192.168.1.201,WRITE,/tmp/test.txt,1641086460,1024,1,0,1024,0,0.05,1000,1000,single,low
+192.168.1.202,READ,/etc/shadow,1641086520,800,10,8000,0,2,0.2,0,0,random,high
+192.168.1.203,SETATTR,/bin/su,1641086580,1048576,1,0,0,1,0.25,0,0,single,low
+192.168.1.204,READ,/var/log/auth.log,1641086640,8192,5,40960,0,0,0.15,1000,1000,sequential,medium
+192.168.1.205,WRITE,/home/user/normal.doc,1641086700,2048,2,0,4096,0,0.08,1000,1000,sequential,low
+192.168.1.206,READ,/proc/version,1641086760,64,1,64,0,0,0.01,1000,1000,single,low
+192.168.1.207,WRITE,/tmp/backdoor.sh,1641086820,512,1,0,512,0,0.04,1000,1000,single,medium
+192.168.1.208,READ,/home/admin/.ssh/id_rsa,1641086880,2048,3,6144,0,0,0.12,1000,1000,sequential,medium
+192.168.1.209,SETATTR,/etc/sudoers,1641086940,512,1,0,0,1,0.18,0,0,single,low

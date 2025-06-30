@@ -1,0 +1,45 @@
+{
+    "ebpf_program": "nfs_monitor.bpf.o",
+    "ml_service": {
+      "enabled": true,
+      "model_path": "./models/",
+      "training_interval": 3600,
+      "anomaly_threshold": 0.7,
+      "threat_threshold": 0.8
+    },
+    "security_policy": {
+      "enable_access_control": 1,
+      "enable_xattr_protection": 1,
+      "enable_exec_control": 1,
+      "enable_mount_control": 1,
+      "strict_mode": 0,
+      "log_level": 2
+    },
+    "monitoring": {
+      "event_buffer_size": 10240,
+      "poll_timeout": 1000,
+      "stats_interval": 30
+    },
+    "output": {
+      "log_file": "/var/log/nfs_monitor.log",
+      "json_output": true,
+      "console_output": true
+    },
+    "console": {
+      "enabled": true,
+      "prompt": "NFS-Monitor> "
+    },
+    "xdp": {
+      "interface": "eth0",
+      "cache_size": 1024,
+      "rate_limit": 10000
+    },
+    "blacklist": {
+      "ips": [],
+      "file_patterns": [
+        "*.tmp",
+        "/tmp/*",
+        "*.log"
+      ]
+    }
+  }

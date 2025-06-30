@@ -1,0 +1,32 @@
+[Unit]
+Description=NFS eBPF监控服务
+Documentation=https://github.com/your-repo/nfs-ebpf
+After=network.target nfs-kernel-server.service
+Requires=nfs-kernel-server.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/nfs-ebpf
+Environment=PYTHONPATH=/opt/nfs-ebpf
+ExecStartPre=/opt/nfs-ebpf/scripts/check_env.sh
+ExecStart=/opt/nfs-ebpf/nfs_ebpf_loader --config /opt/nfs-ebpf/config/nfs_monitor.json
+ExecStop=/bin/kill -TERM $MAINPID
+Restart=always
+RestartSec=10
+TimeoutStartSec=30
+TimeoutStopSec=30
+
+# 安全设置
+NoNewPrivileges=false
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/var/log /sys/fs/bpf /opt/nfs-ebpf
+
+# 资源限制
+LimitNOFILE=65536
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
